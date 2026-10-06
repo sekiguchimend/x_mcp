@@ -1,0 +1,665 @@
+import crypto from "crypto";
+import OAuth from "oauth-1.0a";
+import { OAuth2Manager } from "./oauth2.js";
+
+const API_BASE = "https://api.x.com/2";
+const UPLOAD_BASE = "https://upload.twitter.com/1.1";
+
+interface RateLimitInfo {
+  limit: number;
+  remaining: number;
+  reset: number;
+}
+
+interface XApiResponse<T = unknown> {
+  data?: T;
+  meta?: {
+    result_count?: number;
+    next_token?: string;
+    previous_token?: string;
+  };
+  includes?: Record<string, unknown[]>;
+  errors?: Array<{ message: string; title?: string; detail?: string; type?: string }>;
+}
+
+interface ProcessingInfo {
+  state: "pending" | "in_progress" | "succeeded" | "failed" | string;
+  check_after_secs?: number;
+  progress_percent?: number;
+  error?: { code?: number; name?: string; message?: string };
+}
+
+export interface XApiConfig {
+  apiKey: string;
+  apiSecret: string;
+  accessToken: string;
+  accessTokenSecret: string;
+  bearerToken: string;
+  oauth2ClientId?: string;
+  oauth2ClientSecret?: string;
+}
+
+export class XApiClient {
+  private oauth: OAuth;
+  private token: OAuth.Token;
+  private bearerToken: string;
+  private authenticatedUserId: string | null = null;
+  private oauth2: OAuth2Manager;
+
+  constructor(private config: XApiConfig) {
+    this.oauth = new OAuth({
+      consumer: { key: config.apiKey, secret: config.apiSecret },
+      signature_method: "HMAC-SHA1",
+      hash_function(baseString, key) {
+        return crypto.createHmac("sha1", key).update(baseString).digest("base64");
+      },
+    });
+    this.token = { key: config.accessToken, secret: config.accessTokenSecret };
+    this.bearerToken = config.bearerToken;
+    this.oauth2 = new OAuth2Manager(
+      config.oauth2ClientId || config.apiKey,
+      config.oauth2ClientSecret || config.apiSecret,
+    );
+  }
+
+  getOAuth2Manager(): OAuth2Manager {
+    return this.oauth2;
+  }
+
+  private async oauth2Fetch(
+    url: string,
+    method: string,
+    body?: unknown,
+  ): Promise<Response> {
+    const accessToken = await this.oauth2.getAccessToken();
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${accessToken}`,
+    };
+    if (body) {
+      headers["Content-Type"] = "application/json";
+    }
+    const init: RequestInit = { method, headers };
+    if (body) {
+      init.body = JSON.stringify(body);
+    }
+    return fetch(url, init);
+  }
+
+  // --- Internal helpers ---
+
+  private parseRateLimit(headers: Headers): RateLimitInfo | null {
+    const limit = headers.get("x-rate-limit-limit");
+    const remaining = headers.get("x-rate-limit-remaining");
+    const reset = headers.get("x-rate-limit-reset");
+    if (limit && remaining && reset) {
+      return {
+        limit: parseInt(limit, 10),
+        remaining: parseInt(remaining, 10),
+        reset: parseInt(reset, 10),
+      };
+    }
+    return null;
+  }
+
+  private formatRateLimit(rl: RateLimitInfo): string {
+    const resetDate = new Date(rl.reset * 1000);
+    const secondsUntilReset = Math.max(0, Math.ceil((rl.reset * 1000 - Date.now()) / 1000));
+    return `Rate limit: ${rl.remaining}/${rl.limit} remaining. Resets at ${resetDate.toISOString()} (${secondsUntilReset}s)`;
+  }
+
+  private async oauthFetch(
+    url: string,
+    method: string,
+    body?: unknown,
+    contentType?: string,
+  ): Promise<Response> {
+    // For form-urlencoded bodies, include params in OAuth signature per spec.
+    // JSON and multipart (FormData) bodies are excluded from the signature.
+    const isFormEncoded = contentType === "application/x-www-form-urlencoded";
+    const signatureData = isFormEncoded && body
+      ? body as Record<string, string>
+      : undefined;
+
+    const headers: Record<string, string> = {
+      ...this.getOAuthHeaders(url, method, signatureData),
+    };
+    if (contentType) {
+      headers["Content-Type"] = contentType;
+    } else if (body && !(body instanceof FormData)) {
+      headers["Content-Type"] = "application/json";
+    }
+
+    const init: RequestInit = { method, headers };
+    if (body) {
+      if (body instanceof FormData) {
+        init.body = body;
+      } else if (isFormEncoded) {
+        init.body = new URLSearchParams(body as Record<string, string>).toString();
+      } else {
+        init.body = JSON.stringify(body);
+      }
+    }
+
+    return fetch(url, init);
+  }
+
+  private async bearerFetch(url: string): Promise<Response> {
+    return fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${this.bearerToken}`,
+      },
+    });
+  }
+
+  private async handleResponse<T>(response: Response, operation: string): Promise<{ result: T; rateLimit: string }> {
+    const rateLimit = this.parseRateLimit(response.headers);
+    const rateLimitStr = rateLimit ? this.formatRateLimit(rateLimit) : "";
+
+    if (response.status === 429) {
+      const resetTime = rateLimit
+        ? new Date(rateLimit.reset * 1000).toISOString()
+        : "unknown";
+      throw new Error(
+        `Rate limited on ${operation}. Reset at: ${resetTime}. ${rateLimitStr}`,
+      );
+    }
+
+    const text = await response.text();
+    let data: T;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `${operation} failed (HTTP ${response.status}): ${text.slice(0, 500)}`,
+      );
+    }
+
+    if (!response.ok) {
+      const errorBody = data as unknown as XApiResponse;
+      const errorMsg = errorBody.errors
+        ?.map((e) => e.detail || e.message)
+        .join("; ") || text.slice(0, 500);
+      throw new Error(
+        `${operation} failed (HTTP ${response.status}): ${errorMsg}. ${rateLimitStr}`,
+      );
+    }
+
+    return { result: data, rateLimit: rateLimitStr };
+  }
+
+  async getAuthenticatedUserId(): Promise<string> {
+    if (this.authenticatedUserId) return this.authenticatedUserId;
+    const url = `${API_BASE}/users/me`;
+    const response = await this.oauthFetch(url, "GET");
+    const { result } = await this.handleResponse<XApiResponse<{ id: string }>>(response, "getAuthenticatedUser");
+    this.authenticatedUserId = result.data!.id;
+    return this.authenticatedUserId;
+  }
+
+  // --- Tweet operations ---
+
+  async postTweet(params: {
+    text: string;
+    reply_to?: string;
+    quote_tweet_id?: string;
+    poll_options?: string[];
+    poll_duration_minutes?: number;
+    media_ids?: string[];
+  }) {
+    // Optional disclosure: only appended when POST_DISCLOSURE is set, and only
+    // once (never double-appended).
+    let text = params.text;
+    const disclosure = process.env.POST_DISCLOSURE?.trim();
+    if (disclosure && !text.includes(disclosure)) {
+      text = `${text}\n\n${disclosure}`;
+    }
+    const body: Record<string, unknown> = { text };
+
+    if (params.reply_to) {
+      // NOTE: X API restricts programmatic replies (Feb 2024). Replies only
+      // succeed if the original author @mentioned you or quoted your post.
+      // Non-qualifying replies will fail. Use quote_tweet_id as a workaround.
+      body.reply = { in_reply_to_tweet_id: params.reply_to };
+    }
+    if (params.quote_tweet_id) {
+      body.quote_tweet_id = params.quote_tweet_id;
+    }
+    if (params.poll_options && params.poll_options.length > 0) {
+      body.poll = {
+        options: params.poll_options,
+        duration_minutes: params.poll_duration_minutes || 1440,
+      };
+    }
+    if (params.media_ids && params.media_ids.length > 0) {
+      body.media = { media_ids: params.media_ids };
+    }
+
+    const response = await this.oauthFetch(`${API_BASE}/tweets`, "POST", body);
+    return this.handleResponse(response, "postTweet");
+  }
+
+  async deleteTweet(tweetId: string) {
+    const response = await this.oauthFetch(`${API_BASE}/tweets/${tweetId}`, "DELETE");
+    return this.handleResponse(response, "deleteTweet");
+  }
+
+  async getTweet(tweetId: string) {
+    const params = new URLSearchParams({
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,in_reply_to_user_id,referenced_tweets,attachments,entities,lang,note_tweet",
+      expansions: "author_id,referenced_tweets.id,attachments.media_keys",
+      "user.fields": "name,username,verified,profile_image_url,public_metrics",
+      "media.fields": "url,preview_image_url,type,width,height,alt_text",
+    });
+    const url = `${API_BASE}/tweets/${tweetId}?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getTweet");
+  }
+
+  async searchTweets(query: string, maxResults: number = 10, nextToken?: string) {
+    const params = new URLSearchParams({
+      query,
+      max_results: Math.min(Math.max(maxResults, 10), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,lang,note_tweet",
+      expansions: "author_id,attachments.media_keys",
+      "user.fields": "name,username,verified,profile_image_url",
+      "media.fields": "url,preview_image_url,type",
+    });
+    if (nextToken) params.set("next_token", nextToken);
+
+    const url = `${API_BASE}/tweets/search/recent?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "searchTweets");
+  }
+
+  // --- User operations ---
+
+  async getUser(params: { username?: string; userId?: string }) {
+    const fields = new URLSearchParams({
+      "user.fields": "created_at,description,public_metrics,verified,profile_image_url,url,location,pinned_tweet_id",
+    });
+
+    let url: string;
+    if (params.username) {
+      url = `${API_BASE}/users/by/username/${params.username}?${fields}`;
+    } else if (params.userId) {
+      url = `${API_BASE}/users/${params.userId}?${fields}`;
+    } else {
+      throw new Error("Either username or userId must be provided");
+    }
+
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getUser");
+  }
+
+  async getTimeline(userId: string, maxResults: number = 10, nextToken?: string) {
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 5), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,lang,note_tweet",
+      expansions: "author_id,attachments.media_keys,referenced_tweets.id",
+      "user.fields": "name,username,verified",
+      "media.fields": "url,preview_image_url,type",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/users/${userId}/tweets?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getTimeline");
+  }
+
+  async getMentions(maxResults: number = 10, nextToken?: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 5), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,note_tweet",
+      expansions: "author_id",
+      "user.fields": "name,username,verified",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/users/${userId}/mentions?${params}`;
+    const response = await this.oauthFetch(url, "GET");
+    return this.handleResponse(response, "getMentions");
+  }
+
+  async getFollowers(userId: string, maxResults: number = 100, nextToken?: string) {
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 1), 1000).toString(),
+      "user.fields": "created_at,description,public_metrics,verified,profile_image_url",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/users/${userId}/followers?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getFollowers");
+  }
+
+  async getFollowing(userId: string, maxResults: number = 100, nextToken?: string) {
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 1), 1000).toString(),
+      "user.fields": "created_at,description,public_metrics,verified,profile_image_url",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/users/${userId}/following?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getFollowing");
+  }
+
+  // --- Engagement operations ---
+
+  async likeTweet(tweetId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/likes`, "POST", {
+      tweet_id: tweetId,
+    });
+    return this.handleResponse(response, "likeTweet");
+  }
+
+  async retweet(tweetId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/retweets`, "POST", {
+      tweet_id: tweetId,
+    });
+    return this.handleResponse(response, "retweet");
+  }
+
+  async unlikeTweet(tweetId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/likes/${tweetId}`, "DELETE");
+    return this.handleResponse(response, "unlikeTweet");
+  }
+
+  async unretweet(tweetId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/retweets/${tweetId}`, "DELETE");
+    return this.handleResponse(response, "unretweet");
+  }
+
+  async followUser(targetUserId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/following`, "POST", {
+      target_user_id: targetUserId,
+    });
+    return this.handleResponse(response, "followUser");
+  }
+
+  async unfollowUser(targetUserId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/following/${targetUserId}`, "DELETE");
+    return this.handleResponse(response, "unfollowUser");
+  }
+
+  async muteUser(targetUserId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/muting`, "POST", {
+      target_user_id: targetUserId,
+    });
+    return this.handleResponse(response, "muteUser");
+  }
+
+  async unmuteUser(targetUserId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/muting/${targetUserId}`, "DELETE");
+    return this.handleResponse(response, "unmuteUser");
+  }
+
+  async blockUser(targetUserId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/blocking`, "POST", {
+      target_user_id: targetUserId,
+    });
+    return this.handleResponse(response, "blockUser");
+  }
+
+  async unblockUser(targetUserId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauthFetch(`${API_BASE}/users/${userId}/blocking/${targetUserId}`, "DELETE");
+    return this.handleResponse(response, "unblockUser");
+  }
+
+  async hideReply(tweetId: string, hidden: boolean) {
+    const response = await this.oauthFetch(`${API_BASE}/tweets/${tweetId}/hidden`, "PUT", { hidden });
+    return this.handleResponse(response, "hideReply");
+  }
+
+  // --- Retrieval ---
+
+  async getHomeTimeline(maxResults: number = 10, nextToken?: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 5), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,lang,note_tweet",
+      expansions: "author_id,attachments.media_keys,referenced_tweets.id",
+      "user.fields": "name,username,verified",
+      "media.fields": "url,preview_image_url,type",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    // reverse_chronological is a user-context endpoint (OAuth 1.0a), with the
+    // query params included in the signature.
+    const response = await this.oauthGetSigned(
+      `${API_BASE}/users/${userId}/timelines/reverse_chronological`,
+      Object.fromEntries(params),
+    );
+    return this.handleResponse(response, "getHomeTimeline");
+  }
+
+  async getLikedTweets(userId: string, maxResults: number = 10, nextToken?: string) {
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 5), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,lang,note_tweet",
+      expansions: "author_id,attachments.media_keys",
+      "user.fields": "name,username,verified,profile_image_url",
+      "media.fields": "url,preview_image_url,type",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/users/${userId}/liked_tweets?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getLikedTweets");
+  }
+
+  async getRetweeters(tweetId: string, maxResults: number = 100, nextToken?: string) {
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 1), 100).toString(),
+      "user.fields": "created_at,description,public_metrics,verified,profile_image_url",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/tweets/${tweetId}/retweeted_by?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getRetweeters");
+  }
+
+  async getQuoteTweets(tweetId: string, maxResults: number = 10, nextToken?: string) {
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 10), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,lang,note_tweet",
+      expansions: "author_id",
+      "user.fields": "name,username,verified,profile_image_url",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/tweets/${tweetId}/quote_tweets?${params}`;
+    const response = await this.bearerFetch(url);
+    return this.handleResponse(response, "getQuoteTweets");
+  }
+
+  // --- Direct messages ---
+
+  async sendDirectMessage(participantId: string, text: string) {
+    // DM to a single user, creating/continuing a 1:1 conversation. Requires
+    // OAuth 1.0a user context (dm.write).
+    const response = await this.oauthFetch(
+      `${API_BASE}/dm_conversations/with/${participantId}/messages`,
+      "POST",
+      { text },
+    );
+    return this.handleResponse(response, "sendDirectMessage");
+  }
+
+  // --- Media upload ---
+
+  async uploadMedia(
+    buffer: Buffer,
+    mimeType: string,
+    mediaCategory: string = "tweet_image",
+  ) {
+    const uploadUrl = `${UPLOAD_BASE}/media/upload.json`;
+    const totalBytes = buffer.length;
+
+    // INIT
+    const initRes = await this.oauthFetch(
+      uploadUrl,
+      "POST",
+      {
+        command: "INIT",
+        media_type: mimeType,
+        total_bytes: totalBytes.toString(),
+        media_category: mediaCategory,
+      },
+      "application/x-www-form-urlencoded",
+    );
+    const { result: initData } = await this.handleResponse<{ media_id_string: string }>(
+      initRes,
+      "uploadMedia:INIT",
+    );
+    const mediaId = initData.media_id_string;
+
+    // APPEND -- upload in 1MB chunks (multipart, params excluded from OAuth sig)
+    const chunkSize = 1024 * 1024;
+    for (let i = 0; i * chunkSize < totalBytes; i++) {
+      const chunk = buffer.subarray(i * chunkSize, (i + 1) * chunkSize);
+      const formData = new FormData();
+      formData.append("command", "APPEND");
+      formData.append("media_id", mediaId);
+      formData.append("segment_index", i.toString());
+      formData.append("media_data", chunk.toString("base64"));
+
+      const appendRes = await this.oauthFetch(uploadUrl, "POST", formData);
+
+      if (!appendRes.ok) {
+        const text = await appendRes.text();
+        throw new Error(`uploadMedia:APPEND segment ${i} failed (HTTP ${appendRes.status}): ${text}`);
+      }
+    }
+
+    // FINALIZE
+    const finalizeRes = await this.oauthFetch(
+      uploadUrl,
+      "POST",
+      {
+        command: "FINALIZE",
+        media_id: mediaId,
+      },
+      "application/x-www-form-urlencoded",
+    );
+    const finalizeResult = await this.handleResponse<{ processing_info?: ProcessingInfo }>(
+      finalizeRes,
+      "uploadMedia:FINALIZE",
+    );
+
+    // Videos and GIFs are transcoded asynchronously: FINALIZE returns a
+    // processing_info block and the media_id is not usable until it reports
+    // "succeeded". Poll STATUS until then (or fail / time out).
+    await this.waitForMediaProcessing(mediaId, finalizeResult.result.processing_info);
+
+    return { mediaId, rateLimit: finalizeResult.rateLimit };
+  }
+
+  /** Poll media/upload STATUS until processing succeeds, fails, or times out (5 min). */
+  private async waitForMediaProcessing(
+    mediaId: string,
+    initial: ProcessingInfo | undefined,
+  ): Promise<void> {
+    let info = initial;
+    const deadline = Date.now() + 5 * 60 * 1000; // hard 5-minute cap
+    while (info && info.state !== "succeeded") {
+      if (info.state === "failed") {
+        const err = info.error;
+        const detail = err?.message || err?.name || (err ? JSON.stringify(err) : "unknown error");
+        throw new Error(`media processing failed: ${detail}`);
+      }
+      const waitMs = Math.max(1, info.check_after_secs ?? 1) * 1000;
+      if (Date.now() + waitMs > deadline) {
+        throw new Error("media processing timed out after 5 minutes");
+      }
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+      const statusRes = await this.oauthGetSigned(`${UPLOAD_BASE}/media/upload.json`, {
+        command: "STATUS",
+        media_id: mediaId,
+      });
+      const { result } = await this.handleResponse<{ processing_info?: ProcessingInfo }>(
+        statusRes,
+        "uploadMedia:STATUS",
+      );
+      info = result.processing_info;
+      if (!info) break; // no processing_info → done
+    }
+  }
+
+  /** GET with OAuth 1.0a, signing the query parameters (required for user-context GETs). */
+  private async oauthGetSigned(baseUrl: string, params: Record<string, string>): Promise<Response> {
+    const headers = this.getOAuthHeaders(baseUrl, "GET", params);
+    const qs = new URLSearchParams(params).toString();
+    return fetch(`${baseUrl}?${qs}`, { method: "GET", headers });
+  }
+
+  private getOAuthHeaders(url: string, method: string, data?: Record<string, string>): Record<string, string> {
+    const requestData: { url: string; method: string; data?: Record<string, string> } = { url, method };
+    if (data) {
+      requestData.data = data;
+    }
+    const authHeader = this.oauth.toHeader(this.oauth.authorize(requestData, this.token));
+    return { Authorization: authHeader.Authorization };
+  }
+
+  // --- Bookmarks ---
+
+  async getBookmarks(maxResults: number = 10, nextToken?: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const params = new URLSearchParams({
+      max_results: Math.min(Math.max(maxResults, 1), 100).toString(),
+      "tweet.fields": "created_at,public_metrics,author_id,conversation_id,entities,lang,note_tweet",
+      expansions: "author_id,attachments.media_keys",
+      "user.fields": "name,username,verified,profile_image_url",
+      "media.fields": "url,preview_image_url,type",
+    });
+    if (nextToken) params.set("pagination_token", nextToken);
+
+    const url = `${API_BASE}/users/${userId}/bookmarks?${params}`;
+    const response = await this.oauth2Fetch(url, "GET");
+    return this.handleResponse(response, "getBookmarks");
+  }
+
+  async bookmarkTweet(tweetId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauth2Fetch(`${API_BASE}/users/${userId}/bookmarks`, "POST", {
+      tweet_id: tweetId,
+    });
+    return this.handleResponse(response, "bookmarkTweet");
+  }
+
+  async unbookmarkTweet(tweetId: string) {
+    const userId = await this.getAuthenticatedUserId();
+    const response = await this.oauth2Fetch(
+      `${API_BASE}/users/${userId}/bookmarks/${tweetId}`,
+      "DELETE",
+    );
+    return this.handleResponse(response, "unbookmarkTweet");
+  }
+
+  // --- Metrics ---
+
+  async getTweetMetrics(tweetId: string) {
+    const params = new URLSearchParams({
+      "tweet.fields": "public_metrics,non_public_metrics,organic_metrics",
+    });
+    const url = `${API_BASE}/tweets/${tweetId}?${params}`;
+    // Metrics require user context (OAuth 1.0a) for non_public_metrics
+    const response = await this.oauthFetch(url, "GET");
+    return this.handleResponse(response, "getTweetMetrics");
+  }
+}
