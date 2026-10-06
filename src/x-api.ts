@@ -499,6 +499,40 @@ export class XApiClient {
     return this.handleResponse(response, "sendDirectMessage");
   }
 
+  // --- Conversations ---
+
+  /**
+   * Reconstruct a full thread/conversation: fetch the target tweet to learn its
+   * conversation_id, then pull every post in that conversation via recent
+   * search (last ~7 days). Returns the root plus the replies in time order.
+   */
+  async getConversation(tweetId: string, maxResults: number = 50) {
+    const root = await this.getTweet(tweetId);
+    const rootData = (root.result as XApiResponse<{ conversation_id?: string }>).data;
+    const conversationId = rootData?.conversation_id;
+    if (!conversationId) {
+      throw new Error("could not determine conversation_id for this tweet");
+    }
+    const thread = await this.searchTweets(
+      `conversation_id:${conversationId}`,
+      Math.min(Math.max(maxResults, 10), 100),
+    );
+    const replies = ((thread.result as XApiResponse<Array<{ created_at?: string }>>).data ?? [])
+      .slice()
+      .sort((a, b) => (a.created_at ?? "").localeCompare(b.created_at ?? ""));
+    return {
+      result: {
+        conversation_id: conversationId,
+        root: rootData,
+        root_includes: (root.result as XApiResponse).includes,
+        replies,
+        replies_includes: (thread.result as XApiResponse).includes,
+        note: "Replies come from recent search (last ~7 days); older replies may be missing.",
+      },
+      rateLimit: thread.rateLimit,
+    };
+  }
+
   // --- Media upload ---
 
   async uploadMedia(

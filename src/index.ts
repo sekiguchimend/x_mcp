@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import { z } from "zod";
 import { XApiClient } from "./x-api.js";
 import { resolveMediaInput } from "./media.js";
+import { splitIntoTweets, weightedLength } from "./text.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
@@ -81,6 +82,60 @@ async function resolveMediaIds(
     ids.push(...(await uploadMediaUrls(mediaUrls)));
   }
   return ids.length > 0 ? ids : undefined;
+}
+
+interface PublicMetrics {
+  like_count?: number;
+  retweet_count?: number;
+  reply_count?: number;
+  quote_count?: number;
+  bookmark_count?: number;
+  impression_count?: number;
+}
+
+// Summarize the engagement of a batch of the authenticated user's own posts.
+function computeDigest(tweets: Array<{ id?: string; text?: string; created_at?: string; public_metrics?: PublicMetrics }>) {
+  const scored = tweets.map((t) => {
+    const m = t.public_metrics ?? {};
+    const engagement =
+      (m.like_count ?? 0) + (m.retweet_count ?? 0) + (m.reply_count ?? 0) + (m.quote_count ?? 0);
+    return {
+      id: t.id,
+      preview: (t.text ?? "").replace(/\s+/g, " ").slice(0, 80),
+      created_at: t.created_at,
+      engagement,
+      impressions: m.impression_count,
+      metrics: m,
+    };
+  });
+  const count = scored.length;
+  const totalEngagement = scored.reduce((a, b) => a + b.engagement, 0);
+  const totalImpressions = scored.reduce((a, b) => a + (b.impressions ?? 0), 0);
+
+  const buckets = new Map<number, { sum: number; posts: number }>();
+  for (const s of scored) {
+    if (!s.created_at) continue;
+    const hour = new Date(s.created_at).getUTCHours();
+    const b = buckets.get(hour) ?? { sum: 0, posts: 0 };
+    b.sum += s.engagement;
+    b.posts += 1;
+    buckets.set(hour, b);
+  }
+  const bestHours = [...buckets.entries()]
+    .map(([hour, v]) => ({ hour_utc: hour, avg_engagement: Math.round((v.sum / v.posts) * 100) / 100, posts: v.posts }))
+    .sort((a, b) => b.avg_engagement - a.avg_engagement)
+    .slice(0, 3);
+
+  const topPosts = [...scored].sort((a, b) => b.engagement - a.engagement).slice(0, 3);
+
+  return {
+    analyzed_posts: count,
+    total_engagement: totalEngagement,
+    avg_engagement: count ? Math.round((totalEngagement / count) * 100) / 100 : 0,
+    engagement_rate: totalImpressions > 0 ? Math.round((totalEngagement / totalImpressions) * 10000) / 10000 : null,
+    best_posting_hours_utc: bestHours,
+    top_posts: topPosts,
+  };
 }
 
 // ============================================================
@@ -697,6 +752,144 @@ server.tool(
     try {
       const { result, rateLimit } = await client.sendDirectMessage(user_id, text);
       return { content: [{ type: "text", text: formatResult(result, rateLimit) }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+// ============================================================
+// THREADS & COMPOSING
+// ============================================================
+
+server.tool(
+  "post_thread",
+  "Post a thread (a chain of self-replies). Provide either `texts` (each item becomes one post) or a single long `text` that is auto-split into <=280-weighted-char posts at sentence/word boundaries (never cutting a URL). Returns every posted tweet id/URL. If a post fails mid-thread, the posts made so far are returned with the error.",
+  {
+    text: z.string().optional().describe("A long post to auto-split into a thread"),
+    texts: z.array(z.string()).optional().describe("Explicit list of posts, one per item (overrides text)"),
+    media_urls: z.array(z.string()).optional().describe("Up to 4 https media URLs attached to the FIRST post of the thread"),
+    number_tweets: z.boolean().optional().describe("Append ' (i/n)' to each post (default false)"),
+  },
+  async ({ text, texts, media_urls, number_tweets }) => {
+    const posted: Array<{ index: number; id?: string; url?: string }> = [];
+    try {
+      let segments = texts && texts.length > 0
+        ? texts
+        : text
+          ? splitIntoTweets(text, number_tweets ? 270 : 280)
+          : [];
+      if (segments.length === 0) {
+        throw new Error("provide either texts[] or text");
+      }
+      if (number_tweets) {
+        const n = segments.length;
+        segments = segments.map((s, i) => `${s} (${i + 1}/${n})`);
+      }
+      // Validate up front so we never post a partial thread with a doomed segment.
+      segments.forEach((s, i) => {
+        const { length } = weightedLength(s);
+        if (length > 280) {
+          throw new Error(`segment ${i + 1} is ${length} weighted chars (>280); shorten it or use \`text\` for auto-split`);
+        }
+      });
+
+      const firstMediaIds = await resolveMediaIds(undefined, media_urls);
+      let replyTo: string | undefined;
+      for (let i = 0; i < segments.length; i++) {
+        const { result } = await client.postTweet({
+          text: segments[i],
+          reply_to: replyTo,
+          media_ids: i === 0 ? firstMediaIds : undefined,
+        });
+        const id = (result as { data?: { id?: string } })?.data?.id;
+        posted.push({ index: i, id, url: id ? `https://x.com/i/web/status/${id}` : undefined });
+        if (!id) throw new Error(`thread stopped at post ${i + 1}: no tweet id returned`);
+        replyTo = id;
+      }
+      return { content: [{ type: "text", text: formatResult({ thread: posted, count: posted.length }, "") }] };
+    } catch (e: unknown) {
+      return {
+        content: [{ type: "text", text: `Error: ${(e as Error).message}\nPosted so far: ${JSON.stringify(posted)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "preview_post",
+  "Check a post before sending it: computes X's weighted character count (URLs = 23, most CJK/emoji = 2) and flags problems. No post is created. Use this to avoid 403s from over-length text.",
+  {
+    text: z.string().describe("The post text to measure"),
+    media_count: z.number().optional().describe("How many media items you plan to attach"),
+    has_poll: z.boolean().optional().describe("Whether the post will include a poll"),
+  },
+  async ({ text, media_count, has_poll }) => {
+    const { length, urlCount } = weightedLength(text);
+    const limit = 280;
+    const warnings: string[] = [];
+    if (length > limit) warnings.push(`text is ${length - limit} weighted characters over the ${limit} limit`);
+    if ((media_count ?? 0) > 4) warnings.push("a post can attach at most 4 media items");
+    if (has_poll && (media_count ?? 0) > 0) warnings.push("a post cannot have both a poll and media");
+    return {
+      content: [{
+        type: "text",
+        text: formatResult({
+          weighted_length: length,
+          limit,
+          remaining: limit - length,
+          over_limit: length > limit,
+          url_count: urlCount,
+          would_need_thread: length > limit,
+          thread_post_count: splitIntoTweets(text).length,
+          warnings,
+        }, ""),
+      }],
+    };
+  },
+);
+
+// ============================================================
+// CONVERSATIONS
+// ============================================================
+
+server.tool(
+  "get_conversation",
+  "Fetch a whole thread/conversation from any tweet in it: returns the root post and the replies in time order (replies come from recent search, last ~7 days). Useful for reading full context before replying or summarizing.",
+  {
+    tweet_id: z.string().describe("Any tweet ID or URL in the conversation"),
+    max_results: z.number().optional().describe("Max replies to fetch (10-100, default 50)"),
+  },
+  async ({ tweet_id, max_results }) => {
+    try {
+      const { result, rateLimit } = await client.getConversation(parseTweetId(tweet_id), max_results ?? 50);
+      return { content: [{ type: "text", text: formatResult(result, rateLimit) }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
+  },
+);
+
+// ============================================================
+// ANALYTICS DIGEST
+// ============================================================
+
+server.tool(
+  "get_analytics_digest",
+  "Summarize the performance of your recent posts in one call: total/average engagement, engagement rate (when impressions are available), best posting hours (UTC), and your top posts.",
+  {
+    max_results: z.number().optional().describe("How many recent posts to analyze (5-100, default 20)"),
+  },
+  async ({ max_results }) => {
+    try {
+      const userId = await client.getAuthenticatedUserId();
+      const { result, rateLimit } = await client.getTimeline(
+        userId,
+        Math.min(Math.max(max_results ?? 20, 5), 100),
+      );
+      const tweets = (result as { data?: Array<{ id?: string; text?: string; created_at?: string; public_metrics?: PublicMetrics }> })?.data ?? [];
+      return { content: [{ type: "text", text: formatResult(computeDigest(tweets), rateLimit) }] };
     } catch (e: unknown) {
       return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
     }

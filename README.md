@@ -13,6 +13,9 @@ Works with **Claude Code**, **Claude Desktop**, **OpenAI Codex**, **Cursor**, **
 | Category | Tools | What You Can Say | Status |
 |----------|-------|------------------|--------|
 | **Post** | `post_tweet`, `quote_tweet`, `delete_tweet` | "Post 'hello world' on X" / "Write a long-form post about..." | OK |
+| **Thread** | `post_thread`, `preview_post` | "Turn this into a thread" / "Will this fit in one tweet?" | OK |
+| **Context** | `get_conversation` | "Read the whole thread before replying" | OK |
+| **Insights** | `get_analytics_digest` | "How did my posts do this week?" | OK |
 | **Read** | `get_tweet`, `search_tweets`, `get_timeline`, `get_mentions`, `get_home_timeline` | "Show me my home timeline" | OK |
 | **Users** | `get_user`, `get_followers`, `get_following` | "Look up @openai" / "Who does this user follow?" | OK |
 | **Engage** | `retweet`, `unretweet`, `unlike_tweet` | "Retweet this" / "Undo that like" | OK |
@@ -77,6 +80,15 @@ Then pass the returned `media_id` to any post tool via `media_ids`.
 ## Long-form posts
 
 `post_tweet` accepts text longer than 280 characters; X publishes it as a long-form post automatically on eligible/Premium accounts. Just pass the full text in `text`.
+
+---
+
+## Threads, previews, context & analytics
+
+- **`post_thread`** — post a chain of self-replies. Pass `texts` (one post per item) or a single long `text` that is auto-split into ≤280-weighted-char posts at sentence/word boundaries (URLs are never cut). `media_urls` attach to the first post; `number_tweets: true` appends ` (i/n)`.
+- **`preview_post`** — measure a draft using X's weighted count (URLs = 23, most CJK/emoji = 2) and flag over-length or invalid poll+media combos. No post is created; use it to avoid 403s.
+- **`get_conversation`** — from any tweet in a thread, fetch the root plus replies in time order (replies via recent search, last ~7 days) so the whole context can be read before replying/summarizing.
+- **`get_analytics_digest`** — one-call summary of your recent posts: total/average engagement, engagement rate (when impressions are available), best posting hours (UTC), and your top posts.
 
 ---
 
